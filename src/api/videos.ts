@@ -1,5 +1,4 @@
 import { respondWithJSON } from "./json";
-
 import { type ApiConfig } from "../config";
 import type { BunRequest } from "bun";
 import { BadRequestError, NotFoundError, UserForbiddenError } from "./errors";
@@ -43,19 +42,26 @@ export async function handlerUploadVideo(cfg: ApiConfig, req: BunRequest) {
   const tmpPath = "tmp/video.mp4";
   await Bun.write(tmpPath, uploadedVideo);
 
+
   const aspectRatio = await getVideoAspectRatio(tmpPath);
+
+  const processedPath = await processVideoForFastStart(tmpPath);
+
   const key = `${aspectRatio}/${randomBytes(32).toString("hex")}.mp4`;
   try {
-    await cfg.s3Client.file(key, { bucket: cfg.s3Bucket, type: "video/mp4" }).write(Bun.file(tmpPath));
+    await cfg.s3Client.file(key, { bucket: cfg.s3Bucket, type: "video/mp4" }).write(Bun.file(processedPath));
   } finally {
     await Bun.file(tmpPath).unlink();
+    await Bun.file(processedPath).unlink();
   }
+
 
   video.videoURL = `https://${cfg.s3Bucket}.s3.${cfg.s3Region}.amazonaws.com/${key}`;
   updateVideo(cfg.db, video);
 
   return respondWithJSON(200, video);
 }
+
 
 async function getVideoAspectRatio(filePath: string): Promise<string> {
   const proc = Bun.spawn(
@@ -80,4 +86,23 @@ async function getVideoAspectRatio(filePath: string): Promise<string> {
   if (ratio === Math.floor(16 / 9 * 100)) return "landscape";
   if (ratio === Math.floor(9 / 16 * 100)) return "portrait";
   return "other";
+}
+
+export async function processVideoForFastStart(inputFilePath: string): Promise<string> {
+  const outputFilePath = `${inputFilePath}.processed`;
+  const proc = Bun.spawn(
+    ["ffmpeg", "-i", inputFilePath, "-movflags", "faststart", "-map_metadata", "0", "-codec", "copy", "-f", "mp4", outputFilePath],
+    { stdout: "pipe", stderr: "pipe" },
+  );
+
+  const [stderrText, exitCode] = await Promise.all([
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+
+  if (exitCode !== 0) {
+    throw new Error(`ffmpeg error: ${stderrText}`);
+  }
+
+  return outputFilePath;
 }
